@@ -225,8 +225,147 @@ app.post("/api/verify-code", (req, res) => {
 app.get("/api/account-exists", async (req, res) => {
   const { contact } = req.query;
   if (!contact) return res.status(400).json({ error: "Falta contact" });
-  const result = await pool.query("SELECT id FROM users WHERE contact = $1", [contact]);
-  res.json({ exists: result.rows.length > 0 });
+  const result = await pool.query("SELECT id, method FROM users WHERE contact = $1", [contact]);
+  const row = result.rows[0];
+  res.json({ exists: !!row, method: row ? row.method : null });
+});
+
+// ---------------------------------------------------------------
+// Iniciar sesión con Google / Facebook — ambos son gratis (a diferencia
+// de "Iniciar sesión con Apple", que exige una cuenta de desarrollador de
+// pago, por eso no está incluido).
+//
+// Cómo funciona: el navegador va a Google/Facebook, la persona inicia
+// sesión ahí (su contraseña nunca pasa por nuestro servidor), y el
+// proveedor regresa aquí con un código. Lo cambiamos por su correo y
+// nombre, y si ya existe una cuenta con ese correo, entra directo; si es
+// nueva, mandamos al navegador de vuelta a la app pidiendo su país para
+// terminar de crear la cuenta.
+// ---------------------------------------------------------------
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const FACEBOOK_CLIENT_ID = process.env.FACEBOOK_CLIENT_ID;
+const FACEBOOK_CLIENT_SECRET = process.env.FACEBOOK_CLIENT_SECRET;
+const BACKEND_URL = process.env.BACKEND_URL || "https://mi-backend-finanzas.onrender.com";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://educacion-financiera-hn.netlify.app";
+
+async function findOrCreateSessionForOAuth(res, email, name, provider) {
+  const existing = await pool.query("SELECT id FROM users WHERE contact = $1", [email]);
+  if (existing.rows.length > 0) {
+    const userId = existing.rows[0].id;
+    const token = crypto.randomBytes(32).toString("hex");
+    await pool.query("INSERT INTO sessions (token, user_id) VALUES ($1, $2)", [token, userId]);
+    res.redirect(`${FRONTEND_URL}/?session_token=${token}`);
+  } else {
+    // Cuenta nueva: todavía no tenemos su país, así que no la creamos
+    // aquí — mandamos a la app a pedirlo, y ahí se termina de crear.
+    const params = new URLSearchParams({
+      oauth_new: "1", oauth_provider: provider, oauth_email: email, oauth_name: name || email.split("@")[0],
+    });
+    res.redirect(`${FRONTEND_URL}/?${params}`);
+  }
+}
+
+app.get("/auth/google", (req, res) => {
+  if (!GOOGLE_CLIENT_ID) return res.status(500).send("Iniciar sesión con Google no está configurado en el servidor.");
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: `${BACKEND_URL}/auth/google/callback`,
+    response_type: "code",
+    scope: "openid email profile",
+    access_type: "online",
+    prompt: "select_account",
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+});
+
+app.get("/auth/google/callback", async (req, res) => {
+  const { code, error } = req.query;
+  if (error || !code) return res.redirect(`${FRONTEND_URL}/?oauth_error=${encodeURIComponent(error || "sin_codigo")}`);
+  try {
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        code,
+        redirect_uri: `${BACKEND_URL}/auth/google/callback`,
+        grant_type: "authorization_code",
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error("No se pudo obtener el token de acceso de Google.");
+
+    const profileRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const profile = await profileRes.json();
+    if (!profile.email) throw new Error("Google no compartió tu correo.");
+
+    await findOrCreateSessionForOAuth(res, profile.email, profile.name, "google");
+  } catch (err) {
+    console.error("Error en Google OAuth:", err.message);
+    res.redirect(`${FRONTEND_URL}/?oauth_error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+app.get("/auth/facebook", (req, res) => {
+  if (!FACEBOOK_CLIENT_ID) return res.status(500).send("Iniciar sesión con Facebook no está configurado en el servidor.");
+  const params = new URLSearchParams({
+    client_id: FACEBOOK_CLIENT_ID,
+    redirect_uri: `${BACKEND_URL}/auth/facebook/callback`,
+    response_type: "code",
+    scope: "email public_profile",
+  });
+  res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
+});
+
+app.get("/auth/facebook/callback", async (req, res) => {
+  const { code, error } = req.query;
+  if (error || !code) return res.redirect(`${FRONTEND_URL}/?oauth_error=${encodeURIComponent(error || "sin_codigo")}`);
+  try {
+    const params = new URLSearchParams({
+      client_id: FACEBOOK_CLIENT_ID,
+      client_secret: FACEBOOK_CLIENT_SECRET,
+      code,
+      redirect_uri: `${BACKEND_URL}/auth/facebook/callback`,
+    });
+    const tokenRes = await fetch(`https://graph.facebook.com/v19.0/oauth/access_token?${params}`);
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error("No se pudo obtener el token de acceso de Facebook.");
+
+    const profileRes = await fetch(
+      `https://graph.facebook.com/me?fields=email,name&access_token=${tokenData.access_token}`
+    );
+    const profile = await profileRes.json();
+    if (!profile.email) throw new Error("Facebook no compartió tu correo.");
+
+    await findOrCreateSessionForOAuth(res, profile.email, profile.name, "facebook");
+  } catch (err) {
+    console.error("Error en Facebook OAuth:", err.message);
+    res.redirect(`${FRONTEND_URL}/?oauth_error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+// Termina de crear la cuenta de alguien que inició sesión con Google/Facebook
+// por primera vez (una vez que ya nos dio su país).
+app.post("/api/oauth-signup", async (req, res) => {
+  const { name, email, country, provider } = req.body;
+  if (!name || !email || !country || !provider) return res.status(400).json({ error: "Faltan datos" });
+
+  const existing = await pool.query("SELECT id FROM users WHERE contact = $1", [email]);
+  if (existing.rows.length > 0) return res.status(409).json({ error: "Ya existe una cuenta con ese correo." });
+
+  const result = await pool.query(
+    `INSERT INTO users (name, country, method, contact, password_hash, salt)
+     VALUES ($1, $2, $3, $4, '', '') RETURNING id, name, country, method, contact`,
+    [name, country, `oauth_${provider}`, email]
+  );
+  const userRow = result.rows[0];
+  const token = crypto.randomBytes(32).toString("hex");
+  await pool.query("INSERT INTO sessions (token, user_id) VALUES ($1, $2)", [token, userRow.id]);
+  res.json({ ok: true, token, user: toPublicUser(userRow) });
 });
 
 app.post("/api/signup", async (req, res) => {
