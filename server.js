@@ -246,7 +246,7 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const FACEBOOK_CLIENT_ID = process.env.FACEBOOK_CLIENT_ID;
 const FACEBOOK_CLIENT_SECRET = process.env.FACEBOOK_CLIENT_SECRET;
-const BACKEND_URL = process.env.BACKEND_URL || "https://mi-backend-finanzas.onrender.com";
+const BACKEND_URL = process.env.BACKEND_URL || "https://mi-backend-educacion-financiera.onrender.com";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://educacion-financiera-hn.netlify.app";
 
 async function findOrCreateSessionForOAuth(res, email, name, provider) {
