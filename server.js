@@ -102,6 +102,11 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL;
 // Gmail: respaldo gratis que manda a CUALQUIER correo (hasta 500 al día),
 // sin necesitar un dominio propio verificado como sí pide Resend.
+// Brevo: como Resend, usa HTTPS (no SMTP), así que SÍ funciona en el plan
+// gratis de Render (que bloquea las conexiones SMTP salientes, por eso
+// Gmail no funcionaba). Solo pide verificar tu propio correo, sin dominio.
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL;
 const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
 const TEXTBELT_KEY = process.env.TEXTBELT_KEY || "textbelt";
@@ -133,6 +138,23 @@ async function sendViaResend(toEmail, code) {
   if (!res.ok) throw new Error(`Resend respondió ${res.status}: ${await res.text()}`);
 }
 
+async function sendViaBrevo(toEmail, code) {
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
+    throw new Error("BREVO_API_KEY o BREVO_SENDER_EMAIL no configurados en el servidor.");
+  }
+  const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: { "api-key": BREVO_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sender: { email: BREVO_SENDER_EMAIL, name: "Educación Financiera" },
+      to: [{ email: toEmail }],
+      subject: `Tu código de verificación: ${code}`,
+      htmlContent: `<p>Tu código de verificación para Educación Financiera es:</p><h2>${code}</h2><p>Vence en 10 minutos.</p>`,
+    }),
+  });
+  if (!res.ok) throw new Error(`Brevo respondió ${res.status}: ${await res.text()}`);
+}
+
 let _gmailTransporter = null;
 function getGmailTransporter() {
   if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
@@ -157,16 +179,22 @@ async function sendViaGmail(toEmail, code) {
   });
 }
 
-// Intenta Resend primero (si está configurado); si falla o no está
-// configurado, intenta Gmail automáticamente como respaldo — así, con
-// solo configurar Gmail, ya puedes mandar correos reales a cualquier
-// dirección, sin pagar por un dominio.
+// Intenta Resend primero; si falla, intenta Brevo (funciona en Render,
+// a diferencia de Gmail, porque usa HTTPS en vez de SMTP); si también
+// falla, intenta Gmail como último recurso (solo funcionaría fuera de
+// Render, o en un plan de pago que no bloquee SMTP).
 async function sendEmailCode(toEmail, code) {
   try {
     await sendViaResend(toEmail, code);
     return;
   } catch (resendErr) {
-    console.error("Resend falló, probando con el respaldo (Gmail):", resendErr.message);
+    console.error("Resend falló, probando con el respaldo (Brevo):", resendErr.message);
+  }
+  try {
+    await sendViaBrevo(toEmail, code);
+    return;
+  } catch (brevoErr) {
+    console.error("Brevo falló, probando con el último respaldo (Gmail):", brevoErr.message);
   }
   await sendViaGmail(toEmail, code);
 }
