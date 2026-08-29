@@ -563,6 +563,10 @@ app.post("/api/subscribe", async (req, res) => {
 // Asistente de IA — responde preguntas de finanzas personales.
 // Límite diario por usuario, para controlar el costo del servicio.
 // ---------------------------------------------------------------
+// Gemini de Google: nivel gratuito real, sin fecha de vencimiento, sin
+// tarjeta de crédito. Si algún día configuras ANTHROPIC_API_KEY también,
+// se usa como respaldo automático si Gemini fallara.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ASSISTANT_DAILY_LIMIT = 20;
 const assistantUsage = new Map(); // userId -> { count, date }
@@ -574,8 +578,59 @@ clara y práctica — máximo 3-4 oraciones por respuesta, salvo que la pregunta
 No des consejos de inversión personalizados ni garantices resultados financieros. Si te
 preguntan algo fuera de finanzas, redirige amablemente el tema hacia finanzas personales.`;
 
+async function askGemini(history, message) {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY no configurada.");
+  const contents = [...history, { role: "user", content: message }].map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents,
+        systemInstruction: { parts: [{ text: ASSISTANT_SYSTEM_PROMPT }] },
+        generationConfig: { maxOutputTokens: 400 },
+      }),
+    }
+  );
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || "Error al consultar Gemini.");
+  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!reply) throw new Error("Gemini no devolvió una respuesta.");
+  return reply;
+}
+
+async function askClaude(history, message) {
+  if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY no configurada.");
+  const messages = [...history, { role: "user", content: message }];
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-3-5-haiku-20241022",
+      max_tokens: 400,
+      system: ASSISTANT_SYSTEM_PROMPT,
+      messages,
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || "Error al consultar Claude.");
+  const reply = data.content?.[0]?.text;
+  if (!reply) throw new Error("Claude no devolvió una respuesta.");
+  return reply;
+}
+
 app.post("/api/assistant", async (req, res) => {
-  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: "El asistente no está configurado en el servidor." });
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "El asistente no está configurado en el servidor." });
+  }
 
   const { userId, message, history } = req.body;
   if (!userId || !message) return res.status(400).json({ error: "Falta userId o message" });
@@ -586,26 +641,16 @@ app.post("/api/assistant", async (req, res) => {
     return res.status(429).json({ error: `Llegaste al límite de ${ASSISTANT_DAILY_LIMIT} preguntas por hoy. Vuelve mañana.` });
   }
 
-  try {
-    const messages = [...(history || []).slice(-8), { role: "user", content: message }];
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-3-5-haiku-20241022",
-        max_tokens: 400,
-        system: ASSISTANT_SYSTEM_PROMPT,
-        messages,
-      }),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || "Error al consultar el asistente.");
+  const historyMessages = (history || []).slice(-8);
 
-    const reply = data.content?.[0]?.text || "No pude generar una respuesta, intenta de nuevo.";
+  try {
+    let reply;
+    try {
+      reply = await askGemini(historyMessages, message);
+    } catch (geminiErr) {
+      console.error("Gemini falló, probando con el respaldo (Claude):", geminiErr.message);
+      reply = await askClaude(historyMessages, message);
+    }
 
     assistantUsage.set(userId, { count: (usage && usage.date === today ? usage.count : 0) + 1, date: today });
     res.json({ ok: true, reply });
