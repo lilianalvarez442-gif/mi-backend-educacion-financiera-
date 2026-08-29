@@ -448,7 +448,7 @@ app.post("/api/signup", async (req, res) => {
 
   const existing = await pool.query("SELECT id FROM users WHERE contact = $1", [contact]);
   if (existing.rows.length > 0) {
-    return res.status(409).json({ error: "Ya existe una cuenta con ese correo/teléfono" });
+    return res.status(409).json({ error: "Ya existe una cuenta con ese usuario" });
   }
 
   const { hash, salt } = hashPassword(password);
@@ -557,6 +557,62 @@ app.post("/api/subscribe", async (req, res) => {
   if (!userId || !subscription) return res.status(400).json({ error: "Falta userId o subscription" });
   await pool.query("UPDATE users SET push_subscription = $1 WHERE id = $2", [JSON.stringify(subscription), userId]);
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------
+// Asistente de IA — responde preguntas de finanzas personales.
+// Límite diario por usuario, para controlar el costo del servicio.
+// ---------------------------------------------------------------
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const ASSISTANT_DAILY_LIMIT = 20;
+const assistantUsage = new Map(); // userId -> { count, date }
+
+const ASSISTANT_SYSTEM_PROMPT = `Eres el asistente de la app "Educación Financiera", enfocada en Honduras.
+Ayudas con preguntas de finanzas personales: presupuesto, ahorro, deudas, bancos, inversiones,
+seguros, e impuestos hondureños (ISV, ISR, IHSS, RAP). Responde en español, de forma breve,
+clara y práctica — máximo 3-4 oraciones por respuesta, salvo que la pregunta pida más detalle.
+No des consejos de inversión personalizados ni garantices resultados financieros. Si te
+preguntan algo fuera de finanzas, redirige amablemente el tema hacia finanzas personales.`;
+
+app.post("/api/assistant", async (req, res) => {
+  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: "El asistente no está configurado en el servidor." });
+
+  const { userId, message, history } = req.body;
+  if (!userId || !message) return res.status(400).json({ error: "Falta userId o message" });
+
+  const today = todayISO();
+  const usage = assistantUsage.get(userId);
+  if (usage && usage.date === today && usage.count >= ASSISTANT_DAILY_LIMIT) {
+    return res.status(429).json({ error: `Llegaste al límite de ${ASSISTANT_DAILY_LIMIT} preguntas por hoy. Vuelve mañana.` });
+  }
+
+  try {
+    const messages = [...(history || []).slice(-8), { role: "user", content: message }];
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-3-5-haiku-20241022",
+        max_tokens: 400,
+        system: ASSISTANT_SYSTEM_PROMPT,
+        messages,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || "Error al consultar el asistente.");
+
+    const reply = data.content?.[0]?.text || "No pude generar una respuesta, intenta de nuevo.";
+
+    assistantUsage.set(userId, { count: (usage && usage.date === today ? usage.count : 0) + 1, date: today });
+    res.json({ ok: true, reply });
+  } catch (err) {
+    console.error("Error en el asistente:", err.message);
+    res.status(502).json({ error: "No se pudo conectar con el asistente. Intenta de nuevo." });
+  }
 });
 
 app.listen(PORT, async () => {
